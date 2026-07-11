@@ -2,6 +2,8 @@ const input = document.getElementById("message-input");
 const button = document.getElementById("send-btn");
 const chatBox = document.getElementById("chat-box");
 
+const webSearchToggle = document.getElementById("web-search-toggle")
+
 function addMessage(sender, text="") {
     const div = document.createElement("div")
     div.innerHTML  = `<strong>${sender}</strong> <span>${text}</span>`;
@@ -30,7 +32,8 @@ button.addEventListener("click", async () => {
                 "Content-Type": "application/json"
             },
             body: JSON.stringify({
-                message: message
+                message: message,
+                use_web_search: webSearchToggle.checked
             })
         });
 

@@ -12,6 +12,7 @@ from langchain_community.document_loaders import PyMuPDFLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.tools import DuckDuckGoSearchRun 
 
 app = FastAPI(title = "VisaApp")
 app.mount(
@@ -26,8 +27,11 @@ embeddings = OllamaEmbeddings(model = "nomic-embed-text")
 vectorstore = Chroma(embedding_function = embeddings, persist_directory="./chroma_db")
 
 
+search_tool = DuckDuckGoSearchRun()
+
 class ChatRequest(BaseModel):
     message: str
+    use_web_search: bool = True
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -81,20 +85,54 @@ async def chat(request: ChatRequest):
 
     doc_context = "\n\n".join([doc.page_content for doc in relevant_docs])
 
+    web_context = ""
+    if request.use_web_search:
+        routing_prompt = f"""You are a query router. Analyze the following user message and decide if answering it requires real-time, current information from the internet.
+        Respond with exactly one word: 'SEARCH' or 'LOCAL'.
+        User message: "{user_msg}"
+        Response:"""
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                route_resp = await client.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": "llama3.2",
+                        "prompt": routing_prompt,
+                        "stream": False
+                    }
+                )
+                decision = route_resp.json().get("response", "").strip().upper()
+
+                if "SEARCH" in decision:
+                    print(f"Executing Web Search for query '{user_msg}'...")
+                    web_context = search_tool.run(user_msg)
+                    print("Search completed")
+                else:
+                    print("Processing query locally using document context")
+            
+        except Exception as e:
+            print(f"Warning: Routing/Search tool failed: {e}. Falling back to default data.")
+    else:
+        print("Web search explicitly disabled by user. Skipping internet search.")
+
     system_prompt = f"""You are VisaPilot, a RAG-powered web assistant that helps applicants manage a study-abroad or student-visa application from start to finish. 
 
-                    YOUR CORE CAPABILITIES & IDENTITY:
-                    - The user uploads their own documents—including passports, transcripts, financial proof, and embassy correspondence.
-                    - Your job is to check them against current requirements, explain what is missing, answer questions about their specific case, and draft supporting letters.
-                    - You run fully locally so sensitive documents never leave the user’s machine. Keep this in mind and reassure the user if they ask about data privacy.
-                    - You remember each applicant’s case across sessions.
+    YOUR CORE CAPABILITIES & IDENTITY:
+    - The user uploads their own documents—including passports, transcripts, financial proof, and embassy correspondence.
+    - Your job is to check them against current requirements, explain what is missing, answer questions about their specific case, and draft supporting letters.
+    - You run fully locally so sensitive documents never leave the user’s machine. Keep this in mind and reassure the user if they ask about data privacy.
+    - You remember each applicant’s case across sessions.
 
-                    INSTRUCTIONS:
-                    Use the following pieces of context from the user's uploaded documents to answer their question. If the answer is not found in their uploaded files, use your general visa knowledge to help them, but explicitly state that the information wasn't in their uploaded documents.
+    INSTRUCTIONS:
+    Prioritize information found in the USER UPLOADED DOCUMENTS for personal information. Use the LIVE WEB SEARCH RESULTS to answer questions about external constraints, live schedules, current fees, or dynamic embassy rules. 
 
-                    USER UPLOADED DOCUMENTS (Context):
-                    {doc_context}
-                    """
+    USER UPLOADED DOCUMENTS (Context):
+    {doc_context if doc_context else "No local documents uploaded yet relating to this question."}
+
+    LIVE WEB SEARCH RESULTS (Real-time Context):
+    {web_context if web_context else "No web search executed for this query."}
+    """
 
     async def generate():
 

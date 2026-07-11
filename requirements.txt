@@ -9,3 +9,4 @@ langchain-community
 chromadb
 pymupdf
 docx2txt
+ddgs
