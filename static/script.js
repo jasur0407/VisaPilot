@@ -2,11 +2,13 @@ const input = document.getElementById("message-input");
 const button = document.getElementById("send-btn");
 const chatBox = document.getElementById("chat-box");
 
-function addMessage(sender, text) {
+function addMessage(sender, text="") {
     const div = document.createElement("div")
-    div.innerHTML  = `<strong>${sender}</strong> ${text}`;
+    div.innerHTML  = `<strong>${sender}</strong> <span>${text}</span>`;
     chatBox.appendChild(div);
     chatBox.scrollTop = chatBox.scrollHeight
+
+    return div.querySelector("span")
 }
 
 button.addEventListener("click", async () => {
@@ -36,12 +38,23 @@ button.addEventListener("click", async () => {
             throw new Error("Network response err")
         }
 
-        const data = await response.json()
+        const reader = response.body.getReader()
 
-        if (data.error) {
-            addMessage("System", data.error)
-        } else {
-            addMessage("AI", data.answer)
+        const decoder = new TextDecoder()
+
+        const aiMessageElement = addMessage("AI", "")
+
+        while (true) {
+            const {done, value} = await reader.read()
+
+            if (done) {
+                break
+            }
+            
+            const chunk = decoder.decode(value, {stream: true})
+            aiMessageElement.textContent += chunk
+
+            chatBox.scrollTop = chatBox.scrollHeight
         }
 
     } catch(error) {
