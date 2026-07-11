@@ -4,3 +4,8 @@ jinja2
 python-multipart
 httpx
 pydantic
+langchain
+langchain-community
+chromadb
+pymupdf
+docx2txt
