@@ -2,69 +2,99 @@
 <html lang="en">
 
 <head>
-
     <meta charset="UTF-8">
-
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VisaPilot</title>
-
-    <link rel="stylesheet" href="/static/style.css">
-
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Special+Elite&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="../static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 
 <body>
 
-<div class="container">
+<div id="app-layout">
 
-    <header>
+    <!-- Sidebar Section -->
+    <aside id="sidebar">
+        <div class="sidebar-header">
+            <button class="new-chat-btn" id="new-chat-btn">
+                <span>+</span> New Chat
+            </button>
+        </div>
+        <div class="chat-list-container" id="chat-list"></div>
+    </aside>
 
-        <h1>VisaPilot</h1>
+    <!-- Main Application Canvas -->
+    <div id="main-wrapper">
+        
+        <!-- Repeating Airmail Top Border -->
+        <div class="airmail-border"></div>
 
-        <p>Your AI Visa Assistant</p>
+        <div class="container">
+            
+            <!-- Styled Navy Envelope Header -->
+            <header class="envelope-header">
+                <div class="header-content">
+                    <h1 class="logo-title">VisaPilot</h1>
+                    
+                    <!-- Decorative Flight Path -->
+                    <div class="flight-path">
+                        <span class="plane-icon">✈</span>
+                    </div>
+                    
+                    <p class="logo-subtitle">YOUR AI VISA ASSISTANT</p>
+                </div>
+            </header>
 
-    </header>
+            <!-- Retro Dot Divider -->
+            <div class="dotted-divider"></div>
 
-    <main>
+            <!-- Chat Message Thread Box -->
+            <main>
+                <div id="chat-box"></div>
+            </main>
 
-        <div id="chat-box">
+            <!-- Passport Style Document Section -->
+            <div id="upload-section">
+                <div class="docs-stamp">Docs</div>
+                
+                <h3 class="upload-title">✈ UPLOAD VISA DOCUMENTS</h3>
+                <div class="upload-controls">
+                    <input type="file" id="file-input" accept=".pdf, .docx">
+                    <button id="upload-btn">Upload & Learn</button>
+                    <button id="clear-docs-btn">Clear All Files</button>
+                </div>
+                <p id="upload-status"></p>
+            </div>
+
+            <!-- Retro Dot Divider -->
+            <div class="dotted-divider"></div>
+
+            <!-- Submission Area -->
+            <footer>
+                <textarea 
+                    id="message-input" 
+                    placeholder="Ask anything..." 
+                    rows="1"
+                ></textarea>
+                <button id="send-btn">✈ Send</button>
+            </footer>
+
+            <div id="chat-controls">
+                <label class="search-toggle-label">
+                    <input type="checkbox" id="web-search-toggle" checked>
+                    <span>Enable Intelligent Web Search</span>
+                </label>
+            </div>
 
         </div>
-
-    </main>
-
-    <div id="upload-section" style="margin-bottom: 20px; padding: 15px; border: 1px solid #ccc; border-radius: 8px;">
-        <h3>Upload Visa Documents</h3>
-        <input type="file" id="file-input" accept=".pdf, .docx">
-        <button id="upload-btn">Upload & Learn</button>
-        <p id="upload-status" style="font-size: 0.9em; color: #555;"></p>
-    </div>
-
-    <footer>
-
-        <input
-                id="message-input"
-                type="text"
-                placeholder="Ask anything..."
-        >
-
-        <button id="send-btn">
-
-            Send
-
-        </button>
-
-    </footer>
-
-    <div id="chat-controls" style="margin-bottom: 10px; display: flex; align-items: center; gap: 10px;">
-        <label style="font-size: 0.9em; display: flex; align-items: center; gap: 5px; cursor: pointer;">
-            <input type="checkbox" id="web-search-toggle" checked>
-            🌐 Enable Web Search (Real-time data)
-        </label>
     </div>
 
 </div>
 
 <script src="/static/script.js"></script>
-
 </body>
 
 </html>

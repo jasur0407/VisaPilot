@@ -10,3 +10,4 @@ chromadb
 pymupdf
 docx2txt
 ddgs
+asyncio

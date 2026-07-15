@@ -2,11 +2,13 @@ from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import httpx
 import json
 import os
 import shutil
+from typing import List, Optional
+
 
 from langchain_community.document_loaders import PyMuPDFLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -14,7 +16,14 @@ from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.tools import DuckDuckGoSearchRun 
 
-app = FastAPI(title = "VisaApp")
+from mem0 import Memory
+
+app = FastAPI(title="VisaApp")
+
+# Safeguard directory initialization
+os.makedirs("static", exist_ok=True)
+os.makedirs("templates", exist_ok=True)
+
 app.mount(
     "/static",
     StaticFiles(directory="static"),
@@ -22,150 +31,296 @@ app.mount(
 )
 templates = Jinja2Templates(directory="templates")
 
+# Initialize embeddings and Chroma safely
+try:
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    vectorstore = Chroma(embedding_function=embeddings, persist_directory="./chroma_db")
+except Exception as e:
+    print(f"Warning: Failed to initialize LangChain Chroma/Embeddings: {e}")
+    embeddings = None
+    vectorstore = None
 
-embeddings = OllamaEmbeddings(model = "nomic-embed-text")
-vectorstore = Chroma(embedding_function = embeddings, persist_directory="./chroma_db")
+# Initialize DuckDuckGo search tool safely
+try:
+    search_tool = DuckDuckGoSearchRun()
+except Exception as e:
+    print(f"Warning: DuckDuckGo initialization failed: {e}")
+    search_tool = None
 
+# Clean Mem0 configuration
+mem0_config = {
+    "vector_store": {
+        "provider": "chroma",
+        "config": {
+            "collection_name": "visapilot_memories",
+            "path": "./mem0_db"
+        }
+    },
+    "llm": {
+        "provider": "ollama",
+        "config": {
+            "model": "llama3.2",
+            "ollama_base_url": "http://localhost:11434"
+        }
+    },
+    "embedder": {
+        "provider": "ollama",
+        "config": {
+            "model": "nomic-embed-text",
+            "ollama_base_url": "http://localhost:11434"
+        }
+    }
+}
 
-search_tool = DuckDuckGoSearchRun()
+# Fix: Wrap the memory initialization inside the safe try-except check only.
+# Removed the duplicate unprotected instantiation that causes startup crashes.
+memory = None
+try:
+    memory = Memory.from_config(mem0_config)
+except Exception as e:
+    print(f"Warning: Failed to initialize Mem0 memory store: {e}")
+    memory = None
+
+# Request Pydantic models supporting history
+class Message(BaseModel):
+    role: str
+    content: str
 
 class ChatRequest(BaseModel):
     message: str
     use_web_search: bool = True
-
+    chat_history: List[Message] = Field(default_factory=list)
 
 @app.get("/", response_class=HTMLResponse)
-
-async def home(request: Request):
-    return templates.TemplateResponse(
-        request=request,
-        name="index.html"
-    )
-
+async def read_root(request: Request):
+    # Fallback to local index.html if templates folder is missing or doesn't contain it
+    index_path = os.path.join("templates", "index.html")
+    if not os.path.exists(index_path) and os.path.exists("index.html"):
+        with open("index.html", "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return templates.TemplateResponse(request, "index.html")
 
 @app.post("/api/upload")
-async def upload_document(file: UploadFile = File(...)):
-    file_path = f"temp_{file.filename}"
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+async def upload_file(file: UploadFile = File(...)):
+    if vectorstore is None:
+        return {"error": "Vector database not initialized. Please ensure Ollama is running."}
 
+    os.makedirs("temp", exist_ok=True)
+    temp_file_path = os.path.join("temp", file.filename)
+    
     try:
+        # Fix: Save file using safe async read chunks to prevent blocking ASGI loop
+        with open(temp_file_path, "wb") as buffer:
+            while chunk := await file.read(1024 * 1024):
+                buffer.write(chunk)
+
         if file.filename.endswith(".pdf"):
-            loader = PyMuPDFLoader(file_path)
+            loader = PyMuPDFLoader(temp_file_path)
         elif file.filename.endswith(".docx"):
-            loader = Docx2txtLoader(file_path)
+            loader = Docx2txtLoader(temp_file_path)
         else:
-            os.remove(file_path)
-            return {"error": "Unsupported format!!"}
-        
-        documents = loader.load()
+            return {"error": "Unsupported file format. Please upload a PDF or DOCX."}
 
+        docs = loader.load()
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = text_splitter.split_documents(documents)
-        print(f"Successfully split document into {len(chunks)} chunks")
+        splits = text_splitter.split_documents(docs)
+        
+        for split in splits:
+            split.metadata["source"] = file.filename
 
-        vectorstore.add_documents(chunks)
+        vectorstore.add_documents(splits)
+        return {"message": f"Successfully loaded and indexed {file.filename}!"}
     
     except Exception as e:
-        return {"error": f"Failed to process: {str(e)}"}
+        return {"error": f"Failed to process file: {str(e)}"}
+    
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        
-    return {"message": f"Successfully learned from {file.filename}"}
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 
+@app.post("/api/clear-documents")
+async def clear_documents():
+    global vectorstore
+    try:
+        if vectorstore is not None:
+            # 1. Ask Chroma to delete its collection safely via the API (no OS file locks violated!)
+            try:
+                vectorstore.delete_collection()
+            except Exception as coll_err:
+                print(f"Primary collection deletion bypassed/failed: {coll_err}")
+            
+            # 2. Re-initialize a fresh, completely empty collection
+            if embeddings:
+                vectorstore = Chroma(embedding_function=embeddings, persist_directory="./chroma_db")
+                
+            return {"message": "All uploaded documents successfully cleared!"}
+        else:
+            # Fallback for folder deletion only if the active DB connection was never established
+            if os.path.exists("./chroma_db"):
+                shutil.rmtree("./chroma_db")
+            if embeddings:
+                vectorstore = Chroma(embedding_function=embeddings, persist_directory="./chroma_db")
+            return {"message": "All uploaded documents successfully cleared!"}
+            
+    except Exception as e:
+        return {"error": f"Failed to clear documents: {str(e)}"}
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
     user_msg = request.message
+    user_id = "applicant_01"  
+    memory_context = ""
+    retrieved_docs_text = ""
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
-    relevant_docs = retriever.invoke(user_msg)
-    print(f"Found {len(relevant_docs)} matching chunks in the database for query: '{user_msg}'")
-
-    doc_context = "\n\n".join([doc.page_content for doc in relevant_docs])
-
-    web_context = ""
-    if request.use_web_search:
-        routing_prompt = f"""You are a query router. Analyze the following user message and decide if answering it requires real-time, current information from the internet.
-        Respond with exactly one word: 'SEARCH' or 'LOCAL'.
-        User message: "{user_msg}"
-        Response:"""
-
+    # 1. Long-term memory query (handles Mem0 return types dynamically)
+    if memory:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                route_resp = await client.post(
-                    "http://localhost:11434/api/generate",
+            past_memories = memory.search(query=user_msg, filters={"user_id": user_id})
+            results_list = []
+            if isinstance(past_memories, dict):
+                results_list = past_memories.get("results", [])
+            elif isinstance(past_memories, list):
+                results_list = past_memories
+            
+            if results_list:
+                memory_context = "\n".join([f"- {m.get('memory', m)}" for m in results_list if isinstance(m, dict)])
+                print(f"Retrieved {len(results_list)} key historical facts.")
+        except Exception as e:
+            print(f"Failed to query memory bank: {e}")
+
+    # 2. Chroma context search
+    if vectorstore:
+        try:
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+            relevant_docs = retriever.invoke(user_msg)
+            if relevant_docs:
+                retrieved_docs_text = "\n\n".join([
+                    f"--- Source: {doc.metadata.get('source', 'Unknown')} ---\n{doc.page_content}"
+                    for doc in relevant_docs
+                ])
+                print(f"Found {len(relevant_docs)} documents context items.")
+        except Exception as e:
+            print(f"Failed to query document vectorstore: {e}")
+
+    # 3. Dynamic search router decision
+    web_search_context = ""
+    decision = "NO"
+    web_search_triggered = False 
+    
+    if request.use_web_search and search_tool:
+        # Ask Ollama to decide if we need a web search
+        try:
+            routing_prompt = (
+                f"Determine if the user query requires real-time information, current event details, "
+                f"live data, current dates, or web search to answer accurately.\n"
+                f"Query: '{user_msg}'\n"
+                f"Reply with ONLY 'YES' or 'NO' and nothing else."
+            )
+            
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    "http://localhost:11434/api/chat",
                     json={
                         "model": "llama3.2",
-                        "prompt": routing_prompt,
+                        "messages": [{"role": "user", "content": routing_prompt}],
                         "stream": False
                     }
                 )
-                decision = route_resp.json().get("response", "").strip().upper()
-
-                if "SEARCH" in decision:
-                    print(f"Executing Web Search for query '{user_msg}'...")
-                    web_context = search_tool.run(user_msg)
-                    print("Search completed")
-                else:
-                    print("Processing query locally using document context")
-            
+                if response.status_code == 200:
+                    data = response.json()
+                    decision = data.get("message", {}).get("content", "").strip().upper()
+                    print(f"Search router decision: {decision}")
         except Exception as e:
-            print(f"Warning: Routing/Search tool failed: {e}. Falling back to default data.")
-    else:
-        print("Web search explicitly disabled by user. Skipping internet search.")
+            print(f"Failed to run search router: {e}")
 
-    system_prompt = f"""You are VisaPilot, a RAG-powered web assistant that helps applicants manage a study-abroad or student-visa application from start to finish. 
+        # Consolidated and cleaned up single execution block
+        if "YES" in decision:
+            web_search_triggered = True # Mark as triggered to show searching animation
+            print("Web Search decision triggered!")
+            try:
+                # Use safe async search tool execution
+                web_search_context = await search_tool.arun(user_msg)
+            except Exception as e:
+                print(f"Web search execution error: {e}")
 
-    YOUR CORE CAPABILITIES & IDENTITY:
-    - The user uploads their own documents—including passports, transcripts, financial proof, and embassy correspondence.
-    - Your job is to check them against current requirements, explain what is missing, answer questions about their specific case, and draft supporting letters.
-    - You run fully locally so sensitive documents never leave the user’s machine. Keep this in mind and reassure the user if they ask about data privacy.
-    - You remember each applicant’s case across sessions.
+    # 4. Synthesize system prompt template
+    system_prompt = (
+        "You are VisaPilot, an authoritative AI Visa Assistant designed to help applicants "
+        "navigate visa application frameworks, documentation checklists, and application procedures.\n\n"
+    )
 
-    INSTRUCTIONS:
-    Prioritize information found in the USER UPLOADED DOCUMENTS for personal information. Use the LIVE WEB SEARCH RESULTS to answer questions about external constraints, live schedules, current fees, or dynamic embassy rules. 
+    if memory_context:
+        system_prompt += (
+            "### ESTABLISHED APPLICANT CONTEXT (Durable memories from previous chats):\n"
+            "Keep these persistent user facts in mind to personalize your assistance:\n"
+            f"{memory_context}\n\n"
+        )
 
-    USER UPLOADED DOCUMENTS (Context):
-    {doc_context if doc_context else "No local documents uploaded yet relating to this question."}
+    if retrieved_docs_text:
+        system_prompt += (
+            "### UPLOADED VISA DOCUMENTS CONTEXT:\n"
+            "Incorporate this context extracted from documents uploaded by the user to answer accurately:\n"
+            f"{retrieved_docs_text}\n\n"
+        )
 
-    LIVE WEB SEARCH RESULTS (Real-time Context):
-    {web_context if web_context else "No web search executed for this query."}
-    """
+    # UPDATED SECTION TO ELIMINATE REFUSAL CONFLICT:
+    if web_search_context:
+        system_prompt += (
+            "### LIVE WEB SEARCH RESULTS:\n"
+            "You have active, real-time access to the web. The search results below contain live, current information. "
+            "CRITICAL: Do NOT state that you do not have access to real-time information or mention a December 2023 knowledge cutoff. "
+            "Simply answer the user's question directly and confidently using the following real-time data:\n"
+            f"{web_search_context}\n\n"
+        )
+
+    system_prompt += (
+        "Maintain a highly organized, professional, and comforting tone. "
+        "Structure advice with headers, clean bullet points, and numbered steps."
+    )
+
+    # 5. Build full messages sequence payload
+    messages_payload = [{"role": "system", "content": system_prompt}]
+    for msg in request.chat_history:
+        messages_payload.append({"role": msg.role, "content": msg.content})
+    messages_payload.append({"role": "user", "content": user_msg})
 
     async def generate():
-
+        # VISUAL FEEDBACK: Yield status message if search is happening
+        if web_search_triggered:
+            yield "🔍 *Searching the web...*\n\n"
+            
+        yield "" # Flush headers
+        
         full_response = ""
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                async with client.stream(
+                    "POST",
+                    "http://localhost:11434/api/chat",
+                    json={
+                        "model": "llama3.2",
+                        "messages": messages_payload,
+                        "stream": True
+                    }
+                ) as response:
+                    if response.status_code != 200:
+                        yield f"Ollama returned status code {response.status_code}. Make sure Ollama is running!"
+                        return
 
-        async with httpx.AsyncClient(timeout=120) as client:
-
-            async with client.stream(
-                "POST",
-                "http://localhost:11434/api/chat",
-                json={
-                    "model": "llama3.2",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_msg}
-                    ],
-                    "stream": True
-                }
-            ) as response:
-                
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-
-                    try:
-                        data = json.loads(line)
-
-                        if "message" in data and "content" in data["message"]:
-                            token = data["message"]["content"]
-                            full_response += token
-                            yield token
-                    except json.JSONDecodeError:
-                        continue
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                            if "message" in data and "content" in data["message"]:
+                                token = data["message"]["content"]
+                                full_response += token
+                                yield token
+                        except json.JSONDecodeError:
+                            continue
+        except Exception as e:
+            yield f"\n\n[Ollama Connection Error: Verify that Ollama is running local server on port 11434 and 'llama3.2' model is installed. Error: {str(e)}]"
+            return
 
     return StreamingResponse(
         generate(),
