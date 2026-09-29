@@ -7,14 +7,15 @@ import httpx
 import json
 import os
 import shutil
+import base64
 from typing import List, Optional
-
 
 from langchain_community.document_loaders import PyMuPDFLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.tools import DuckDuckGoSearchRun 
+from langchain_core.documents import Document
 
 from mem0 import Memory
 
@@ -91,14 +92,70 @@ class ChatRequest(BaseModel):
     use_web_search: bool = True
     chat_history: List[Message] = Field(default_factory=list)
 
+async def analyze_id_or_passport_image(image_bytes: bytes, filename: str) -> str:
+    """Uses Ollama Vision capabilities (Qwen2.5-VL / Llava / Moondream) to extract key details from ID and Passport images."""
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    
+    # Direct OCR prompt
+    prompt = (
+        "Read and transcribe all visible text in this document photo verbatim. "
+        "List all details you can find including: Full Name, Document Number / Card Number, "
+        "Date of Birth, Expiry Date, Issue Date, Country, and any other printed numbers or text."
+    )
+    
+    target_models = [
+        "qwen2.5vl:3b",
+        "qwen2.5vl:latest",
+        "qwen2.5vl",
+        "llava:latest",
+        "llava",
+        "moondream:latest",
+        "moondream"
+    ]
+    
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        for model in target_models:
+            try:
+                print(f"[Vision System] Sending image to '{model}'...")
+                response = await client.post(
+                    "http://localhost:11434/api/chat",
+                    json={
+                        "model": model,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": prompt,
+                                "images": [base64_image]
+                            }
+                        ],
+                        "stream": False
+                    }
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    extracted_content = data.get("message", {}).get("content", "").strip()
+                    if extracted_content and not extracted_content.startswith("ids ="):
+                        print(f"[Vision System] Success with '{model}'!")
+                        return extracted_content
+                else:
+                    print(f"[Vision System] Model '{model}' returned status {response.status_code}")
+
+            except Exception as err:
+                print(f"[Vision System] Error querying '{model}': {err}")
+                continue
+                
+    return "⚠️ Unable to analyze image. Please ensure a vision model is running."
+
+
 @app.get("/", response_class=HTMLResponse)
 async def read_root(request: Request):
-    # Fallback to local index.html if templates folder is missing or doesn't contain it
     index_path = os.path.join("templates", "index.html")
     if not os.path.exists(index_path) and os.path.exists("index.html"):
         with open("index.html", "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
     return templates.TemplateResponse(request, "index.html")
+
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -107,19 +164,43 @@ async def upload_file(file: UploadFile = File(...)):
 
     os.makedirs("temp", exist_ok=True)
     temp_file_path = os.path.join("temp", file.filename)
-    
+    filename_lower = file.filename.lower()
+    image_extensions = (".png", ".jpg", ".jpeg", ".webp")
+
     try:
-        # Fix: Save file using safe async read chunks to prevent blocking ASGI loop
+        # Save file locally
         with open(temp_file_path, "wb") as buffer:
             while chunk := await file.read(1024 * 1024):
                 buffer.write(chunk)
 
-        if file.filename.endswith(".pdf"):
+        # IMAGE ANALYSIS PATH (Passport / ID / Visa Images)
+        if filename_lower.endswith(image_extensions):
+            with open(temp_file_path, "rb") as img_f:
+                image_bytes = img_f.read()
+            
+            extracted_text = await analyze_id_or_passport_image(image_bytes, file.filename)
+            
+            # Save extracted identity document text into vector store so RAG can query it
+            doc = Document(
+                page_content=f"--- Extracted Identity/Passport Data ({file.filename}) ---\n{extracted_text}",
+                metadata={"source": file.filename, "type": "id_passport_analysis"}
+            )
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            splits = text_splitter.split_documents([doc])
+            vectorstore.add_documents(splits)
+
+            return {
+                "message": f"Successfully processed and analyzed image: '{file.filename}'!",
+                "analysis": extracted_text
+            }
+
+        # DOCUMENT PATH (.pdf / .docx)
+        elif filename_lower.endswith(".pdf"):
             loader = PyMuPDFLoader(temp_file_path)
-        elif file.filename.endswith(".docx"):
+        elif filename_lower.endswith(".docx"):
             loader = Docx2txtLoader(temp_file_path)
         else:
-            return {"error": "Unsupported file format. Please upload a PDF or DOCX."}
+            return {"error": "Unsupported file format. Please upload PDF, DOCX, PNG, JPG, or WEBP."}
 
         docs = loader.load()
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)

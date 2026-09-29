@@ -253,7 +253,8 @@ uploadBtn.addEventListener("click", async () => {
         return;
     }
 
-    uploadStatus.textContent = `Uploading and parsing ${file.name}...`;
+    const isImage = file.type.startsWith('image/') || /\.(png|jpe?g|webp)$/i.test(file.name);
+    uploadStatus.textContent = isImage ? `Analyzing ${file.name} with Vision Model...` : `Uploading and parsing ${file.name}...`;
     uploadStatus.style.color = 'blue';
     uploadBtn.disabled = true;
 
@@ -272,20 +273,31 @@ uploadBtn.addEventListener("click", async () => {
             uploadStatus.textContent = data.message;
             uploadStatus.style.color = 'green';
             fileInput.value = '';
+
+            // Inject analysis directly into the active conversation thread
+            const activeChat = chats.find(c => c.id === activeChatId);
+            if (activeChat) {
+                const reportContent = data.analysis 
+                    ? `📄 **Extracted Document Analysis (${file.name}):**\n\n${data.analysis}`
+                    : `✅ Document **${file.name}** has been uploaded and indexed successfully into memory.`;
+                
+                activeChat.messages.push({ role: "assistant", content: reportContent });
+                saveState();
+                renderActiveChatMessages();
+            }
         } else {
             uploadStatus.textContent = data.error || "Upload failed";
             uploadStatus.style.color = 'red';
         }
     } catch (error) {
         console.error("Upload Error:", error);
-        uploadStatus.textContent = "Error establishing context with file processing API.";
+        uploadStatus.textContent = "Error connecting to server during processing.";
         uploadStatus.style.color = 'red';
     } finally {
         uploadBtn.disabled = false;
     }
 });
 
-// Click handler to delete all uploaded and indexed files
 clearDocsBtn.addEventListener("click", async () => {
     if (!confirm("Are you sure you want to delete all uploaded visa documents from VisaPilot's memory?")) {
         return;
