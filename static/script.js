@@ -11,10 +11,12 @@ const uploadStatus = document.getElementById("upload-status");
 const newChatBtn = document.getElementById("new-chat-btn");
 const chatListContainer = document.getElementById("chat-list");
 
-// Fix: Use the modern marked parsing configuration interface
+const clearMemoryBtn = document.getElementById("clear-memory-btn");
+
+// Modern marked parsing configuration interface
 marked.use({ gfm: true, breaks: true });
 
-// Safe Multi-chat parsing with try/catch to protect against local storage corruption
+// Safe Multi-chat parsing
 let chats = [];
 try {
     chats = JSON.parse(localStorage.getItem("visapilot_chats")) || [];
@@ -330,3 +332,42 @@ clearDocsBtn.addEventListener("click", async () => {
         clearDocsBtn.disabled = false;
     }
 });
+
+
+if (clearMemoryBtn) {
+    clearMemoryBtn.addEventListener("click", async () => {
+        const activeChat = chats.find(c => c.id === activeChatId);
+        if (!activeChat) return;
+
+        // Confirm action
+        const confirmed = confirm("Are you sure you want to clear the conversation memory?\n\nThis will reset chat context, but all your uploaded documents/files will remain active!");
+        if (!confirmed) return;
+
+        try {
+            // 1. Send request to clear backend Mem0 context
+            await fetch("/api/clear-memory", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ user_id: activeChat.id })
+            });
+
+            // 2. Wipe messages history, but PRESERVE uploaded_files & checklist
+            activeChat.messages = [];
+            saveState();
+
+            // 3. Refresh chat display
+            renderActiveChatMessages();
+
+            // 4. Render system confirmation message in chat
+            addMessageToBox(
+                "VisaPilot", 
+                "🧹 **Conversation memory has been cleared.** All uploaded files remain active in the workspace context for your next question!", 
+                false
+            );
+
+        } catch (error) {
+            console.error("Error clearing chat memory:", error);
+            alert("Failed to clear backend memory. Please check console logs.");
+        }
+    });
+}

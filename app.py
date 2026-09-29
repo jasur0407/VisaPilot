@@ -246,6 +246,29 @@ async def clear_documents():
     except Exception as e:
         return {"error": f"Failed to clear documents: {str(e)}"}
 
+
+@app.post("/api/clear-memory")
+async def clear_chat_memory(payload: dict):
+    """Clears conversation memory/Mem0 context for a session while preserving uploaded document files."""
+    user_id = payload.get("user_id", "default_user")
+    
+    try:
+        if 'memory' in globals() and memory is not None:
+            try:
+                memory.delete_all(user_id=user_id)
+                print(f"[Memory System] Cleared Mem0 context for user/session: {user_id}")
+            except Exception as mem_err:
+                print(f"[Memory System] Mem0 delete error: {mem_err}")
+
+        return {
+            "status": "success", 
+            "message": "Chat memory successfully cleared. Uploaded documents preserved."
+        }
+    except Exception as e:
+        print(f"[Memory System] Failed to clear memory: {e}")
+        return {"status": "error", "message": str(e)}
+
+
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
     user_msg = request.message

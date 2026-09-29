@@ -441,3 +441,21 @@ footer {
     accent-color: #132e54;
     cursor: pointer;
 }
+
+
+.clear-mem-btn {
+    background-color: transparent;
+    border: 1px solid #d9534f;
+    color: #d9534f;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85em;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+.clear-mem-btn:hover {
+    background-color: #d9534f;
+    color: white;
+}
