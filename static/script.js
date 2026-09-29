@@ -124,14 +124,14 @@ function renderActiveChatMessages() {
     const activeChat = chats.find(c => c.id === activeChatId);
     if (!activeChat) return;
 
-    activeChat.messages.forEach(msg => {
+    activeChat.messages.forEach((msg, msgIndex) => {
         const senderLabel = msg.role === "user" ? "You" : "VisaPilot";
-        addMessageToBox(senderLabel, msg.content, msg.role === "user");
+        addMessageToBox(senderLabel, msg.content, msg.role === "user", msgIndex);
     });
     chatBox.scrollTop = chatBox.scrollHeight;
 }
 
-function addMessageToBox(sender, text = "", isUser = false) {
+function addMessageToBox(sender, text = "", isUser = false, msgIndex = null) {
     const div = document.createElement("div");
     div.classList.add("message-row", isUser ? "you" : "visapilot");
     
@@ -144,8 +144,63 @@ function addMessageToBox(sender, text = "", isUser = false) {
         chatBox.appendChild(div);
         const mdBody = div.querySelector(".markdown-body");
         mdBody.innerHTML = marked.parse(text);
+        
+        // Make checkboxes interactive if message index is present
+        if (msgIndex !== null) {
+            makeCheckboxesInteractive(mdBody, msgIndex);
+        }
         return mdBody;
     }
+}
+
+function makeCheckboxesInteractive(container, msgIndex) {
+    const checkboxes = container.querySelectorAll('input[type="checkbox"]');
+    if (checkboxes.length === 0) return;
+
+    checkboxes.forEach((cb, cbIndex) => {
+        cb.removeAttribute('disabled'); // Enable click interactions
+        cb.classList.add('interactive-task-checkbox');
+
+        cb.addEventListener('change', () => {
+            const activeChat = chats.find(c => c.id === activeChatId);
+            if (!activeChat || !activeChat.messages[msgIndex]) return;
+
+            let content = activeChat.messages[msgIndex].content;
+            let currentTaskCount = 0;
+
+            // Regex match both unchecked [- ] and checked [x] task items
+            const taskRegex = /- \[( |x|X)\]/g;
+            
+            content = content.replace(taskRegex, (match) => {
+                if (currentTaskCount === cbIndex) {
+                    currentTaskCount++;
+                    return cb.checked ? "- [x]" : "- [ ]";
+                }
+                currentTaskCount++;
+                return match;
+            });
+
+            // Persist updated checklist state
+            activeChat.messages[msgIndex].content = content;
+            saveState();
+
+            // Apply line-through visual indicator
+            const listItem = cb.closest('li');
+            if (listItem) {
+                if (cb.checked) {
+                    listItem.classList.add('task-completed');
+                } else {
+                    listItem.classList.remove('task-completed');
+                }
+            }
+        });
+
+        // Initialize strike-through state on first render
+        const listItem = cb.closest('li');
+        if (listItem && cb.checked) {
+            listItem.classList.add('task-completed');
+        }
+    });
 }
 
 function escapeHtml(unsafe) {
@@ -161,85 +216,117 @@ newChatBtn.addEventListener("click", () => {
     createNewChat();
 });
 
-// Helper to prevent input submission during response streams
 function toggleChatControls(disabled) {
     input.disabled = disabled;
     button.disabled = disabled;
 }
 
 button.addEventListener("click", async () => {
-    const messageText = input.value.trim();
-    if (!messageText) return;
+    const userMessage = input.value.trim();
+    if (!userMessage) return;
 
     const activeChat = chats.find(c => c.id === activeChatId);
     if (!activeChat) return;
 
-    // Turn off submission while generating response
+    // 1. Clear input field & disable UI controls while processing
+    input.value = "";
     toggleChatControls(true);
 
-    addMessageToBox("You", messageText, true);
-    input.value = "";
-    input.style.height = "auto";
+    // 2. Push user message to active thread & UI
+    addMessageToBox("You", userMessage, true);
+    activeChat.messages.push({ role: "user", content: userMessage });
 
-    // Extract short-term context prior to appending the new message
-    const payloadHistory = activeChat.messages.map(m => ({
-        role: m.role,
-        content: m.content
-    }));
-
-    activeChat.messages.push({ role: "user", content: messageText });
-    
-    if (activeChat.title === "New Consultation" || activeChat.title === "Initial Consultation") {
-        activeChat.title = messageText.length > 25 ? messageText.substring(0, 22) + "..." : messageText;
-        renderChatList();
+    // 3. Inject current sidebar checklist status into context payload
+    let backendMessage = userMessage;
+    if (activeChat.checklist && activeChat.checklist.length > 0) {
+        const checklistStr = activeChat.checklist
+            .map(item => `- [${item.checked ? 'x' : ' '}] ${item.text}`)
+            .join('\n');
+        backendMessage += `\n\n[System Note - Current Sidebar Checklist Status:\n${checklistStr}]`;
     }
-    saveState();
 
+    // 4. Create streaming message element for assistant
     const streamSpan = addMessageToBox("VisaPilot", "", false);
-    chatBox.scrollTop = chatBox.scrollHeight;
+    let assistantResponse = "";
 
     try {
+        const useWebSearch = document.getElementById('web-search-toggle')?.checked || false;
+
         const response = await fetch("/api/chat", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                message: messageText,
-                use_web_search: webSearchToggle.checked,
-                chat_history: payloadHistory
+                message: backendMessage,
+                chat_history: activeChat.messages.slice(0, -1), // Send history up to previous message
+                use_web_search: useWebSearch
             })
         });
 
         if (!response.ok) {
-            const errorMsg = `Server Connection Failure (${response.statusText})`;
-            streamSpan.innerHTML = marked.parse(errorMsg);
-            // Fix: Do not save transient error messages to chat state to avoid history context pollution
-            return;
+            throw new Error(`Server status ${response.status}`);
         }
 
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
-        let assistantResponse = "";
 
+        // 5. Read streamed tokens
         while (true) {
             const { value, done } = await reader.read();
             if (done) break;
 
             const chunk = decoder.decode(value, { stream: true });
             assistantResponse += chunk;
-            streamSpan.innerHTML = marked.parse(assistantResponse);
+
+            // Temporarily mask XML tags during stream to prevent raw code from showing in the chat bubble
+            let displayResponse = assistantResponse.replace(
+                /<checklist>[\s\S]*?(<\/checklist>|$)/gi, 
+                "\n\n*📋 Updating your right sidebar checklist...*"
+            );
+            
+            streamSpan.innerHTML = marked.parse(displayResponse);
             chatBox.scrollTop = chatBox.scrollHeight;
         }
 
+        // 6. Extract <checklist> block, parse items, and transfer to sidebar
+        const checklistMatch = assistantResponse.match(/<checklist>([\s\S]*?)<\/checklist>/i);
+        if (checklistMatch) {
+            const listContent = checklistMatch[1];
+            if (!activeChat.checklist) activeChat.checklist = [];
+
+            // Regex match markdown tasks: "- [ ] Task name" or "- [x] Task name"
+            const itemRegex = /- \[( |x|X)\] (.*)/g;
+            let itemMatch;
+
+            while ((itemMatch = itemRegex.exec(listContent)) !== null) {
+                const isChecked = itemMatch[1].toLowerCase() === 'x';
+                const text = itemMatch[2].trim();
+
+                // Add unique items to the sidebar list
+                const existingIndex = activeChat.checklist.findIndex(i => i.text === text);
+                if (existingIndex === -1) {
+                    activeChat.checklist.push({ text: text, checked: isChecked });
+                }
+            }
+
+            // Cleanly replace raw XML block with a friendly note in chat bubble
+            assistantResponse = assistantResponse.replace(
+                /<checklist>[\s\S]*?<\/checklist>/i, 
+                "\n\n*📋 I have updated your tracking checklist in the right sidebar.*"
+            ).trim();
+        }
+
+        // 7. Save final assistant message to chat history
         activeChat.messages.push({ role: "assistant", content: assistantResponse });
         saveState();
 
+        // 8. Re-render both chat thread & right sidebar UI
+        renderActiveChatMessages();
+        renderSidebarChecklist();
+
     } catch (error) {
-        console.error("Connection error:", error);
-        const errAlert = "\n\n[Failed to stream response. Please ensure your FastAPI backend is active]";
+        console.error("Chat API Error:", error);
+        const errAlert = "\n\n[Failed to stream response. Please ensure your FastAPI backend is active.]";
         streamSpan.innerHTML = marked.parse(errAlert);
-        // Fix: Do not save error boundaries to active chat context 
     } finally {
         toggleChatControls(false);
         input.focus();
@@ -319,7 +406,7 @@ clearDocsBtn.addEventListener("click", async () => {
         if (response.ok && !data.error) {
             uploadStatus.textContent = "Successfully cleared all uploaded files from memory!";
             uploadStatus.style.color = 'green';
-            fileInput.value = ''; // Reset file input
+            fileInput.value = '';
         } else {
             uploadStatus.textContent = data.error || "Failed to clear documents.";
             uploadStatus.style.color = 'red';
@@ -332,6 +419,44 @@ clearDocsBtn.addEventListener("click", async () => {
         clearDocsBtn.disabled = false;
     }
 });
+
+
+function renderSidebarChecklist() {
+    const sidebarContainer = document.getElementById('checklist-items');
+    if (!sidebarContainer) return;
+    
+    const activeChat = chats.find(c => c.id === activeChatId);
+    sidebarContainer.innerHTML = '';
+    
+    if (!activeChat || !activeChat.checklist || activeChat.checklist.length === 0) {
+        sidebarContainer.innerHTML = '<p style="color: #666; font-size: 0.9em;">No checklist generated yet. Ask VisaPilot for a step-by-step checklist!</p>';
+        return;
+    }
+
+    activeChat.checklist.forEach((item, index) => {
+        const div = document.createElement('div');
+        div.className = `sidebar-task-item ${item.checked ? 'sidebar-task-completed' : ''}`;
+        
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = item.checked;
+        checkbox.id = `sidebar-cb-${index}`;
+        
+        checkbox.addEventListener('change', (e) => {
+            activeChat.checklist[index].checked = e.target.checked;
+            saveState();
+            renderSidebarChecklist(); // Re-render to show strikethrough
+        });
+
+        const label = document.createElement('label');
+        label.htmlFor = `sidebar-cb-${index}`;
+        label.textContent = item.text;
+
+        div.appendChild(checkbox);
+        div.appendChild(label);
+        sidebarContainer.appendChild(div);
+    });
+}
 
 
 if (clearMemoryBtn) {

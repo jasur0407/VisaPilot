@@ -73,8 +73,6 @@ mem0_config = {
     }
 }
 
-# Fix: Wrap the memory initialization inside the safe try-except check only.
-# Removed the duplicate unprotected instantiation that causes startup crashes.
 memory = None
 try:
     memory = Memory.from_config(mem0_config)
@@ -82,7 +80,6 @@ except Exception as e:
     print(f"Warning: Failed to initialize Mem0 memory store: {e}")
     memory = None
 
-# Request Pydantic models supporting history
 class Message(BaseModel):
     role: str
     content: str
@@ -219,24 +216,22 @@ async def upload_file(file: UploadFile = File(...)):
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
+
 @app.post("/api/clear-documents")
 async def clear_documents():
     global vectorstore
     try:
         if vectorstore is not None:
-            # 1. Ask Chroma to delete its collection safely via the API (no OS file locks violated!)
             try:
                 vectorstore.delete_collection()
             except Exception as coll_err:
                 print(f"Primary collection deletion bypassed/failed: {coll_err}")
             
-            # 2. Re-initialize a fresh, completely empty collection
             if embeddings:
                 vectorstore = Chroma(embedding_function=embeddings, persist_directory="./chroma_db")
                 
             return {"message": "All uploaded documents successfully cleared!"}
         else:
-            # Fallback for folder deletion only if the active DB connection was never established
             if os.path.exists("./chroma_db"):
                 shutil.rmtree("./chroma_db")
             if embeddings:
@@ -276,43 +271,52 @@ async def chat(request: ChatRequest):
     memory_context = ""
     retrieved_docs_text = ""
 
-    # 1. Long-term memory query (handles Mem0 return types dynamically)
+    # 1. Fetch long-term memory
     if memory:
         try:
             past_memories = memory.search(query=user_msg, filters={"user_id": user_id})
-            results_list = []
-            if isinstance(past_memories, dict):
-                results_list = past_memories.get("results", [])
-            elif isinstance(past_memories, list):
-                results_list = past_memories
-            
+            results_list = past_memories.get("results", []) if isinstance(past_memories, dict) else past_memories
             if results_list:
                 memory_context = "\n".join([f"- {m.get('memory', m)}" for m in results_list if isinstance(m, dict)])
-                print(f"Retrieved {len(results_list)} key historical facts.")
         except Exception as e:
             print(f"Failed to query memory bank: {e}")
 
-    # 2. Chroma context search
+    # 2. Enhanced RAG Retrieval with Upload Keyword Fallback
     if vectorstore:
         try:
-            retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+            # Direct semantic search
+            retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
             relevant_docs = retriever.invoke(user_msg)
-            if relevant_docs:
+
+            # Fallback: If user asks about uploaded files explicitly, pull vectorstore items directly
+            file_keywords = ["image", "uploaded", "file", "document", "passport", "id", "photo", "inside", "letter", "sponsorship", "pdf", "proof"]
+            if any(kw in user_msg.lower() for kw in file_keywords):
+                all_docs = vectorstore.get()
+                if all_docs and "documents" in all_docs and all_docs["documents"]:
+                    extra_docs = [
+                        f"--- Document ({meta.get('source', 'Uploaded File')}) ---\n{doc}"
+                        for doc, meta in zip(all_docs["documents"], all_docs["metadatas"])
+                    ]
+                    retrieved_docs_text = "\n\n".join(extra_docs)
+
+            if not retrieved_docs_text and relevant_docs:
                 retrieved_docs_text = "\n\n".join([
                     f"--- Source: {doc.metadata.get('source', 'Unknown')} ---\n{doc.page_content}"
                     for doc in relevant_docs
                 ])
-                print(f"Found {len(relevant_docs)} documents context items.")
         except Exception as e:
             print(f"Failed to query document vectorstore: {e}")
 
-    # 3. Dynamic search router decision
+    # 3. Intelligent Search Router (Suppressed when evaluating uploaded documents)
     web_search_context = ""
     decision = "NO"
     web_search_triggered = False 
+
+    # Check if the query specifically target an uploaded file
+    doc_eval_keywords = ["uploaded", "this document", "my letter", "my pdf", "sponsorship letter", "my passport", "my file", "check my", "review my", "sponsorship", "proof requirement"]
+    is_doc_evaluation = any(kw in user_msg.lower() for kw in doc_eval_keywords) and bool(retrieved_docs_text)
     
-    if request.use_web_search and search_tool:
-        # Ask Ollama to decide if we need a web search
+    if request.use_web_search and search_tool and not is_doc_evaluation:
         try:
             routing_prompt = (
                 f"Determine if the user query requires real-time information, current event details, "
@@ -333,69 +337,64 @@ async def chat(request: ChatRequest):
                 if response.status_code == 200:
                     data = response.json()
                     decision = data.get("message", {}).get("content", "").strip().upper()
-                    print(f"Search router decision: {decision}")
         except Exception as e:
             print(f"Failed to run search router: {e}")
 
-        # Consolidated and cleaned up single execution block
         if "YES" in decision:
-            web_search_triggered = True # Mark as triggered to show searching animation
-            print("Web Search decision triggered!")
+            web_search_triggered = True
             try:
-                # Use safe async search tool execution
                 web_search_context = await search_tool.arun(user_msg)
             except Exception as e:
                 print(f"Web search execution error: {e}")
 
-    # 4. Synthesize system prompt template
+    # 4. Construct System Prompt
     system_prompt = (
         "You are VisaPilot, an authoritative AI Visa Assistant designed to help applicants "
         "navigate visa application frameworks, documentation checklists, and application procedures.\n\n"
+        "### CHECKLIST GENERATION RULES:\n"
+        "Whenever the user asks for a checklist, to-do list, or required documents, you MUST wrap the items exactly inside `<checklist>` and `</checklist>` tags.\n"
+        "Structure the items using standard markdown task lists inside the tags.\n"
+        "Example:\n"
+        "<checklist>\n"
+        "- [ ] Valid Passport\n"
+        "- [ ] Travel Insurance\n"
+        "</checklist>\n"
+        "Do not place checkboxes outside of these tags. Keep tasks short and actionable.\n\n"
+        "### DOCUMENT EVALUATION RULES:\n"
+        "When evaluating uploaded document text/analysis provided below:\n"
+        "1. Do NOT output generic advice or general checklists on what a document 'should' contain unless explicitly asked.\n"
+        "2. Evaluate the ACTUAL content provided line-by-line against standard visa/sponsorship requirements.\n"
+        "3. Explicitly state whether the uploaded document passes or fails these checks based on its actual text.\n"
+        "4. Highlight specific details found in the text (e.g., exact sponsor name, specific coverage amount like €12,000) and explicitly point out any missing critical elements (e.g., missing date, missing signature, missing passport number).\n\n"
     )
 
     if memory_context:
-        system_prompt += (
-            "### ESTABLISHED APPLICANT CONTEXT (Durable memories from previous chats):\n"
-            "Keep these persistent user facts in mind to personalize your assistance:\n"
-            f"{memory_context}\n\n"
-        )
+        system_prompt += f"### ESTABLISHED APPLICANT CONTEXT:\n{memory_context}\n\n"
 
     if retrieved_docs_text:
         system_prompt += (
-            "### UPLOADED VISA DOCUMENTS CONTEXT:\n"
-            "Incorporate this context extracted from documents uploaded by the user to answer accurately:\n"
+            "### UPLOADED VISA DOCUMENTS & PASSPORT/ID ANALYSIS:\n"
+            "The user has uploaded documents/images. Here is the extracted content:\n"
             f"{retrieved_docs_text}\n\n"
         )
 
-    # UPDATED SECTION TO ELIMINATE REFUSAL CONFLICT:
     if web_search_context:
-        system_prompt += (
-            "### LIVE WEB SEARCH RESULTS:\n"
-            "You have active, real-time access to the web. The search results below contain live, current information. "
-            "CRITICAL: Do NOT state that you do not have access to real-time information or mention a December 2023 knowledge cutoff. "
-            "Simply answer the user's question directly and confidently using the following real-time data:\n"
-            f"{web_search_context}\n\n"
-        )
+        system_prompt += f"### LIVE WEB SEARCH RESULTS:\n{web_search_context}\n\n"
 
     system_prompt += (
         "Maintain a highly organized, professional, and comforting tone. "
         "Structure advice with headers, clean bullet points, and numbered steps."
     )
 
-    # 5. Build full messages sequence payload
     messages_payload = [{"role": "system", "content": system_prompt}]
     for msg in request.chat_history:
         messages_payload.append({"role": msg.role, "content": msg.content})
     messages_payload.append({"role": "user", "content": user_msg})
 
     async def generate():
-        # VISUAL FEEDBACK: Yield status message if search is happening
         if web_search_triggered:
             yield "🔍 *Searching the web...*\n\n"
             
-        yield "" # Flush headers
-        
-        full_response = ""
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 async with client.stream(
@@ -418,15 +417,10 @@ async def chat(request: ChatRequest):
                             data = json.loads(line)
                             if "message" in data and "content" in data["message"]:
                                 token = data["message"]["content"]
-                                full_response += token
                                 yield token
                         except json.JSONDecodeError:
                             continue
         except Exception as e:
-            yield f"\n\n[Ollama Connection Error: Verify that Ollama is running local server on port 11434 and 'llama3.2' model is installed. Error: {str(e)}]"
-            return
+            yield f"\n\n[Ollama Connection Error: Verify that Ollama is running on port 11434. Error: {str(e)}]"
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/plain"
-    )
+    return StreamingResponse(generate(), media_type="text/plain")
